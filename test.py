@@ -1,0 +1,281 @@
+# test_full_image_patched_inference.py
+"""
+Test script to run iterative inference on a full image by dividing it into
+patches. For each patch, points are predicted iteratively until the model's
+confidence for the next point drops below a threshold, or a maximum number
+of iterations is reached.
+Clears its specific output directory before running.
+Prints the total number of GT points in the original image (for comparison).
+"""
+import os
+import cv2
+import torch
+import numpy as np
+from scipy.io import loadmat
+from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+import glob
+import shutil
+
+# --- Configuration ---
+from config import (
+    DEVICE, MODEL_INPUT_SIZE, IMAGE_DIR_TEST, GT_DIR_TEST,
+    BEST_MODEL_PATH, OUTPUT_DIR, GT_PSF_SIGMA
+)
+from model import VGG19FPNASPP
+
+# ImageNet Mean/Std for Normalization/Unnormalization
+IMG_MEAN_CPU = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMG_STD_CPU = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+# --- Inference Control Parameters ---
+CONFIDENCE_THRESHOLD = 0.5  # Stop if confidence for next point is below this
+MAX_ITERATIONS_PER_PATCH = 100 # Max predictions per patch, even if confidence remains high
+
+# --- Helper Functions ---
+
+def load_gt_points(gt_path):
+    if not os.path.exists(gt_path): return np.array([])
+    try:
+        mat_data = loadmat(gt_path)
+        if 'image_info' in mat_data: return mat_data['image_info'][0, 0][0, 0][0].astype(np.float32)
+        if 'annPoints' in mat_data: return mat_data['annPoints'].astype(np.float32)
+        for _, value in mat_data.items():
+            if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[1] == 2: return value.astype(np.float32)
+        return np.array([])
+    except Exception: return np.array([])
+
+def create_input_psf_from_points(points_list, shape, sigma):
+    h, w = shape
+    delta_map = np.zeros((h, w), dtype=np.float32)
+    if not points_list: # If points_list is empty
+        return delta_map # Return an all-zero map
+    for x, y in points_list:
+        x_coord, y_coord = np.clip(int(round(x)), 0, w - 1), np.clip(int(round(y)), 0, h - 1)
+        delta_map[y_coord, x_coord] += 1.0
+    input_psf = gaussian_filter(delta_map, sigma=sigma, order=0, mode='constant', cval=0.0)
+    max_val = np.max(input_psf)
+    if max_val > 1e-7: input_psf /= max_val
+    return input_psf
+
+def get_patch_coordinates(img_h, img_w, patch_size):
+    """
+    Generates coordinates (x_start, y_start, x_end, y_end) for patches.
+    Assumes img_h, img_w are dimensions of the (potentially padded) image
+    and are >= patch_size.
+    """
+    coords = []
+    # Ensure y_starts and x_starts are correctly generated even if img_dim == patch_size
+    y_range = list(range(0, img_h - patch_size, patch_size))
+    if img_h >= patch_size : # Add the last possible start if not already covered or if it's the only one
+        y_range.append(img_h - patch_size)
+    y_starts = sorted(list(set(y_range)))
+    if not y_starts and img_h >= patch_size : y_starts = [0]
+
+
+    x_range = list(range(0, img_w - patch_size, patch_size))
+    if img_w >= patch_size:
+        x_range.append(img_w - patch_size)
+    x_starts = sorted(list(set(x_range)))
+    if not x_starts and img_w >= patch_size : x_starts = [0]
+
+
+    for sy in y_starts:
+        for sx in x_starts:
+            coords.append((sx, sy, sx + patch_size, sy + patch_size))
+    return coords
+
+def perform_iterative_inference_on_patch(
+    model,
+    image_patch_tensor_batch, # Pre-normalized, batched tensor (1, C, H, W) for the patch
+    psf_sigma=GT_PSF_SIGMA,
+    model_input_size=MODEL_INPUT_SIZE,
+    device=DEVICE,
+    confidence_threshold=CONFIDENCE_THRESHOLD, # Use configured threshold
+    max_iterations=MAX_ITERATIONS_PER_PATCH   # Use configured max iterations
+):
+    predicted_points_local = []
+
+    for iter_count in range(max_iterations):
+        current_input_psf_np = create_input_psf_from_points(
+            predicted_points_local, # Will be empty list for the first iteration
+            shape=(model_input_size, model_input_size),
+            sigma=psf_sigma
+        )
+        current_input_psf_tensor = torch.from_numpy(current_input_psf_np).float().unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            # Model returns: predicted_psf_map, confidence_logits
+            predicted_output_psf_tensor, predicted_confidence_logits = model(image_patch_tensor_batch, current_input_psf_tensor)
+
+        # Get confidence score by applying sigmoid to logits
+        confidence_score = torch.sigmoid(predicted_confidence_logits).item() # .item() to get Python float from (1,1) tensor
+
+        if confidence_score < confidence_threshold:
+            # Optional: print statements for debugging
+            # if iter_count == 0:
+            #     print(f"    Confidence {confidence_score:.3f} < threshold {confidence_threshold:.2f} at first iter. No points predicted.")
+            # else:
+            #     print(f"    Confidence {confidence_score:.3f} < threshold {confidence_threshold:.2f}. Stopping at {len(predicted_points_local)} points.")
+            break # Stop iteration for this patch
+
+        # Extract point from PSF map
+        output_psf_np = predicted_output_psf_tensor.squeeze().cpu().numpy() # (H, W)
+        max_yx = np.unravel_index(np.argmax(output_psf_np), output_psf_np.shape)
+        pred_y, pred_x = max_yx[0], max_yx[1]
+        predicted_points_local.append((pred_x, pred_y))
+        
+        # Optional: print if max_iterations is reached
+        # if iter_count == max_iterations - 1:
+        #     print(f"    Reached max_iterations ({max_iterations}) for patch. Predicted {len(predicted_points_local)} points.")
+            
+    return predicted_points_local
+
+# --- Main Function ---
+def main():
+    print("--- Full Image Patched Iterative Inference Script (Confidence-Driven) ---")
+    patch_level_visuals_enabled = False # Set to True to save individual patch summaries
+                                       # Note: num_pred_fallback_per_patch is removed as confidence drives iterations
+
+    # Output Directory Setup
+    script_output_dir = os.path.join(OUTPUT_DIR, "full_image_patched_outputs_confidence_driven") # New folder
+    if os.path.exists(script_output_dir):
+        print(f"Clearing existing output directory: {script_output_dir}")
+        try: shutil.rmtree(script_output_dir)
+        except OSError as e:
+            print(f"Error clearing directory: {e}. Please close files and retry.")
+            return
+    os.makedirs(script_output_dir, exist_ok=True)
+    print(f"Outputs will be saved in: {script_output_dir}")
+    print(f"Confidence Threshold: {CONFIDENCE_THRESHOLD}, Max Iterations per Patch: {MAX_ITERATIONS_PER_PATCH}")
+
+
+    # Load Model
+    if not os.path.exists(BEST_MODEL_PATH):
+        print(f"Error: Model not found at {BEST_MODEL_PATH}"); return
+    model = VGG19FPNASPP().to(DEVICE)
+    model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+    model.eval()
+    print("Model loaded.")
+
+    # Select Image
+    test_image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR_TEST, '*.jpg')))
+    if not test_image_paths: print(f"No test images in {IMAGE_DIR_TEST}"); return
+    
+    # You can choose a specific image or loop through them
+    # image_path = test_image_paths[25] # Example: Process the 26th image (index 25)
+    # For testing, let's process a few images
+    num_images_to_test = min(5, len(test_image_paths))
+    selected_image_paths = test_image_paths[:num_images_to_test]
+
+
+    for image_path in selected_image_paths:
+        img_filename = os.path.basename(image_path)
+        img_filestem = os.path.splitext(img_filename)[0]
+        gt_path = os.path.join(GT_DIR_TEST, "GT_" + img_filestem + ".mat")
+        print(f"\nProcessing image: {img_filename}")
+
+        # Load Original Image and GT
+        img_orig_bgr = cv2.imread(image_path)
+        if img_orig_bgr is None:
+            print(f"Failed to load image {image_path}. Skipping.")
+            continue
+        img_orig_rgb = cv2.cvtColor(img_orig_bgr, cv2.COLOR_BGR2RGB)
+        gt_orig_global = load_gt_points(gt_path) # (N,2) array (x,y)
+        
+        num_gt_points_original_image = len(gt_orig_global)
+        print(f"Total number of GT points in the original image: {num_gt_points_original_image}")
+
+        # Pad original image if smaller than patch size
+        h_orig, w_orig = img_orig_rgb.shape[:2]
+        pad_h_bottom = max(0, MODEL_INPUT_SIZE - h_orig)
+        pad_w_right = max(0, MODEL_INPUT_SIZE - w_orig)
+        
+        img_to_process = cv2.copyMakeBorder(img_orig_rgb, 0, pad_h_bottom, 0, pad_w_right,
+                                            cv2.BORDER_CONSTANT, value=[0,0,0]) # Pad with black
+        h_proc, w_proc = img_to_process.shape[:2]
+
+        # Get Patch Coordinates for the (padded) image to process
+        patch_coords_list = get_patch_coordinates(h_proc, w_proc, MODEL_INPUT_SIZE)
+        if not patch_coords_list:
+            print(f"  No patches generated for image {img_filename} (h_proc: {h_proc}, w_proc: {w_proc}, patch_size: {MODEL_INPUT_SIZE}). Skipping.")
+            continue
+        print(f"  Generated {len(patch_coords_list)} patches for the image.")
+
+        all_predicted_points_global = [] # Store all (x,y) predictions in original image coords
+
+        for i, (x_start, y_start, x_end, y_end) in enumerate(patch_coords_list):
+            # print(f"    Processing patch {i+1}/{len(patch_coords_list)}: region ({x_start},{y_start}) to ({x_end},{y_end})")
+
+            # Extract patch image data
+            img_patch_np = img_to_process[y_start:y_end, x_start:x_end]
+
+            # Normalize patch and convert to tensor
+            patch_tensor_np = img_patch_np.astype(np.float32) / 255.0
+            patch_tensor_chw = torch.from_numpy(patch_tensor_np).permute(2, 0, 1)
+            patch_tensor_norm = (patch_tensor_chw - IMG_MEAN_CPU) / IMG_STD_CPU
+            patch_tensor_batch = patch_tensor_norm.unsqueeze(0).to(DEVICE) # Batch dim (1, C, H, W)
+
+            # Perform iterative inference on the patch using confidence
+            predicted_points_local = perform_iterative_inference_on_patch(
+                model,
+                patch_tensor_batch,
+                psf_sigma=GT_PSF_SIGMA,
+                model_input_size=MODEL_INPUT_SIZE,
+                device=DEVICE,
+                confidence_threshold=CONFIDENCE_THRESHOLD, # Pass configured value
+                max_iterations=MAX_ITERATIONS_PER_PATCH    # Pass configured value
+            )
+
+            # Convert local predictions to global coordinates and store
+            for plx, ply in predicted_points_local:
+                pgx, pgy = plx + x_start, ply + y_start
+                # Ensure predicted point is within original image bounds (before padding)
+                if pgx < w_orig and pgy < h_orig:
+                     all_predicted_points_global.append((pgx, pgy))
+
+            if patch_level_visuals_enabled and predicted_points_local:
+                # Get GT points local to this patch (for visualization only)
+                gt_local_to_patch = []
+                if gt_orig_global.size > 0:
+                    for gx_orig, gy_orig in gt_orig_global:
+                        if x_start <= gx_orig < x_end and y_start <= gy_orig < y_end:
+                            lx, ly = gx_orig - x_start, gy_orig - y_start
+                            gt_local_to_patch.append((lx, ly))
+                gt_local_to_patch_np = np.array(gt_local_to_patch)
+
+                plt.figure(figsize=(6,6))
+                display_patch_tensor = patch_tensor_batch.squeeze(0).cpu() * IMG_STD_CPU + IMG_MEAN_CPU
+                display_patch_np = np.clip(display_patch_tensor.permute(1, 2, 0).numpy(), 0, 1)
+                plt.imshow(display_patch_np)
+                if gt_local_to_patch_np.size > 0:
+                    plt.scatter(gt_local_to_patch_np[:,0], gt_local_to_patch_np[:,1], s=30, facecolors='none', edgecolors='lime', lw=1, label=f'Local GT ({len(gt_local_to_patch_np)})')
+                preds_local_np = np.array(predicted_points_local)
+                plt.scatter(preds_local_np[:,0], preds_local_np[:,1], s=20, c='red', marker='x', label=f'Local Preds ({len(preds_local_np)})')
+                plt.title(f"Patch {i+1} ({x_start},{y_start}) Results")
+                plt.axis('off'); plt.legend()
+                patch_plot_path = os.path.join(script_output_dir, f"{img_filestem}_patch_{i+1:03d}.png")
+                plt.savefig(patch_plot_path); plt.close()
+
+        # Final Visualization for the current image
+        plt.figure(figsize=(12, 12 * h_orig / w_orig if w_orig > 0 else 12))
+        plt.imshow(img_orig_rgb)
+        if gt_orig_global.size > 0:
+            plt.scatter(gt_orig_global[:, 0], gt_orig_global[:, 1], s=30, facecolors='none', edgecolors='lime', linewidths=1.5, label=f'Ground Truth ({num_gt_points_original_image})')
+        
+        num_predicted_points = len(all_predicted_points_global)
+        if all_predicted_points_global:
+            preds_global_np = np.array(all_predicted_points_global)
+            plt.scatter(preds_global_np[:, 0], preds_global_np[:, 1], s=20, c='red', marker='x', label=f'Predicted ({num_predicted_points})')
+        
+        plt.title(f"Full Image Predictions for {img_filename}\nGT: {num_gt_points_original_image}, Pred: {num_predicted_points}")
+        plt.axis('off'); plt.legend()
+        final_summary_path = os.path.join(script_output_dir, f"{img_filestem}_full_summary_conf.png")
+        plt.savefig(final_summary_path); plt.close()
+        print(f"  Full image processing complete. Total points predicted: {num_predicted_points}")
+        print(f"  Final summary plot saved to: {final_summary_path}")
+
+    print("\n--- All selected images processed. ---")
+
+if __name__ == "__main__":
+    main()
