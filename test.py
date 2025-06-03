@@ -6,6 +6,9 @@ confidence for the next point drops below a threshold, or a maximum number
 of iterations is reached.
 Clears its specific output directory before running.
 Prints the total number of GT points in the original image (for comparison).
+Skips processing patches that have no ground truth annotations.
+Applies Non-Maximum Suppression (NMS) to the final predicted points.
+Calculates and reports Mean Absolute Error (MAE).
 """
 import os
 import cv2
@@ -16,6 +19,7 @@ from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 import glob
 import shutil
+import math # For NMS distance calculation
 
 # --- Configuration ---
 from config import (
@@ -29,8 +33,9 @@ IMG_MEAN_CPU = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMG_STD_CPU = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 # --- Inference Control Parameters ---
-CONFIDENCE_THRESHOLD = 0.5  # Stop if confidence for next point is below this
+CONFIDENCE_THRESHOLD = 0.2  # Stop if confidence for next point is below this
 MAX_ITERATIONS_PER_PATCH = 100 # Max predictions per patch, even if confidence remains high
+NMS_RADIUS = 7 # Radius for Non-Maximum Suppression (in pixels)
 
 # --- Helper Functions ---
 
@@ -65,20 +70,17 @@ def get_patch_coordinates(img_h, img_w, patch_size):
     and are >= patch_size.
     """
     coords = []
-    # Ensure y_starts and x_starts are correctly generated even if img_dim == patch_size
     y_range = list(range(0, img_h - patch_size, patch_size))
-    if img_h >= patch_size : # Add the last possible start if not already covered or if it's the only one
+    if img_h >= patch_size : 
         y_range.append(img_h - patch_size)
     y_starts = sorted(list(set(y_range)))
     if not y_starts and img_h >= patch_size : y_starts = [0]
-
 
     x_range = list(range(0, img_w - patch_size, patch_size))
     if img_w >= patch_size:
         x_range.append(img_w - patch_size)
     x_starts = sorted(list(set(x_range)))
     if not x_starts and img_w >= patch_size : x_starts = [0]
-
 
     for sy in y_starts:
         for sx in x_starts:
@@ -87,58 +89,62 @@ def get_patch_coordinates(img_h, img_w, patch_size):
 
 def perform_iterative_inference_on_patch(
     model,
-    image_patch_tensor_batch, # Pre-normalized, batched tensor (1, C, H, W) for the patch
+    image_patch_tensor_batch, 
     psf_sigma=GT_PSF_SIGMA,
     model_input_size=MODEL_INPUT_SIZE,
     device=DEVICE,
-    confidence_threshold=CONFIDENCE_THRESHOLD, # Use configured threshold
-    max_iterations=MAX_ITERATIONS_PER_PATCH   # Use configured max iterations
+    confidence_threshold=CONFIDENCE_THRESHOLD, 
+    max_iterations=MAX_ITERATIONS_PER_PATCH   
 ):
     predicted_points_local = []
-
     for iter_count in range(max_iterations):
         current_input_psf_np = create_input_psf_from_points(
-            predicted_points_local, # Will be empty list for the first iteration
+            predicted_points_local, 
             shape=(model_input_size, model_input_size),
             sigma=psf_sigma
         )
         current_input_psf_tensor = torch.from_numpy(current_input_psf_np).float().unsqueeze(0).unsqueeze(0).to(device)
-
         with torch.no_grad():
-            # Model returns: predicted_psf_map, confidence_logits
             predicted_output_psf_tensor, predicted_confidence_logits = model(image_patch_tensor_batch, current_input_psf_tensor)
-
-        # Get confidence score by applying sigmoid to logits
-        confidence_score = torch.sigmoid(predicted_confidence_logits).item() # .item() to get Python float from (1,1) tensor
-
+        confidence_score = torch.sigmoid(predicted_confidence_logits).item() 
         if confidence_score < confidence_threshold:
-            # Optional: print statements for debugging
-            # if iter_count == 0:
-            #     print(f"    Confidence {confidence_score:.3f} < threshold {confidence_threshold:.2f} at first iter. No points predicted.")
-            # else:
-            #     print(f"    Confidence {confidence_score:.3f} < threshold {confidence_threshold:.2f}. Stopping at {len(predicted_points_local)} points.")
-            break # Stop iteration for this patch
-
-        # Extract point from PSF map
-        output_psf_np = predicted_output_psf_tensor.squeeze().cpu().numpy() # (H, W)
+            break 
+        output_psf_np = predicted_output_psf_tensor.squeeze().cpu().numpy() 
         max_yx = np.unravel_index(np.argmax(output_psf_np), output_psf_np.shape)
         pred_y, pred_x = max_yx[0], max_yx[1]
         predicted_points_local.append((pred_x, pred_y))
-        
-        # Optional: print if max_iterations is reached
-        # if iter_count == max_iterations - 1:
-        #     print(f"    Reached max_iterations ({max_iterations}) for patch. Predicted {len(predicted_points_local)} points.")
-            
     return predicted_points_local
+
+def apply_nms(points, radius_threshold):
+    """
+    Applies Non-Maximum Suppression to a list of (x, y) points.
+    Points are processed in the order they are given.
+    """
+    if not points:
+        return []
+    
+    points_to_process = list(points) 
+    kept_points = []
+    
+    while points_to_process:
+        current_point = points_to_process.pop(0) 
+        kept_points.append(current_point)
+        
+        remaining_points_after_nms = []
+        for point_to_check in points_to_process:
+            dist = math.sqrt((current_point[0] - point_to_check[0])**2 + (current_point[1] - point_to_check[1])**2)
+            if dist > radius_threshold:
+                remaining_points_after_nms.append(point_to_check)
+        points_to_process = remaining_points_after_nms
+        
+    return kept_points
 
 # --- Main Function ---
 def main():
-    print("--- Full Image Patched Iterative Inference Script (Confidence-Driven) ---")
-    patch_level_visuals_enabled = False # Set to True to save individual patch summaries
-                                       # Note: num_pred_fallback_per_patch is removed as confidence drives iterations
+    print("--- Full Image Patched Iterative Inference Script (Confidence-Driven, NMS, MAE) ---")
+    patch_level_visuals_enabled = False 
 
-    # Output Directory Setup
-    script_output_dir = os.path.join(OUTPUT_DIR, "full_image_patched_outputs_confidence_driven") # New folder
+    script_output_dir = os.path.join(OUTPUT_DIR, "full_image_patched_outputs_confidence_driven_nms_mae") # New folder
     if os.path.exists(script_output_dir):
         print(f"Clearing existing output directory: {script_output_dir}")
         try: shutil.rmtree(script_output_dir)
@@ -147,10 +153,8 @@ def main():
             return
     os.makedirs(script_output_dir, exist_ok=True)
     print(f"Outputs will be saved in: {script_output_dir}")
-    print(f"Confidence Threshold: {CONFIDENCE_THRESHOLD}, Max Iterations per Patch: {MAX_ITERATIONS_PER_PATCH}")
+    print(f"Confidence Threshold: {CONFIDENCE_THRESHOLD}, Max Iterations per Patch: {MAX_ITERATIONS_PER_PATCH}, NMS Radius: {NMS_RADIUS}")
 
-
-    # Load Model
     if not os.path.exists(BEST_MODEL_PATH):
         print(f"Error: Model not found at {BEST_MODEL_PATH}"); return
     model = VGG19FPNASPP().to(DEVICE)
@@ -158,16 +162,16 @@ def main():
     model.eval()
     print("Model loaded.")
 
-    # Select Image
     test_image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR_TEST, '*.jpg')))
     if not test_image_paths: print(f"No test images in {IMAGE_DIR_TEST}"); return
     
-    # You can choose a specific image or loop through them
-    # image_path = test_image_paths[25] # Example: Process the 26th image (index 25)
-    # For testing, let's process a few images
-    num_images_to_test = min(5, len(test_image_paths))
+    num_images_to_test = min(50, len(test_image_paths)) # Process a subset for quick testing
+    # num_images_to_test = len(test_image_paths) # Uncomment to process all test images
     selected_image_paths = test_image_paths[:num_images_to_test]
+    print(f"Will process {len(selected_image_paths)} images for testing.")
 
+    total_absolute_error = 0.0
+    image_count_for_mae = 0
 
     for image_path in selected_image_paths:
         img_filename = os.path.basename(image_path)
@@ -175,107 +179,120 @@ def main():
         gt_path = os.path.join(GT_DIR_TEST, "GT_" + img_filestem + ".mat")
         print(f"\nProcessing image: {img_filename}")
 
-        # Load Original Image and GT
         img_orig_bgr = cv2.imread(image_path)
         if img_orig_bgr is None:
             print(f"Failed to load image {image_path}. Skipping.")
             continue
         img_orig_rgb = cv2.cvtColor(img_orig_bgr, cv2.COLOR_BGR2RGB)
-        gt_orig_global = load_gt_points(gt_path) # (N,2) array (x,y)
+        gt_orig_global = load_gt_points(gt_path) 
         
         num_gt_points_original_image = len(gt_orig_global)
         print(f"Total number of GT points in the original image: {num_gt_points_original_image}")
 
-        # Pad original image if smaller than patch size
         h_orig, w_orig = img_orig_rgb.shape[:2]
         pad_h_bottom = max(0, MODEL_INPUT_SIZE - h_orig)
         pad_w_right = max(0, MODEL_INPUT_SIZE - w_orig)
         
         img_to_process = cv2.copyMakeBorder(img_orig_rgb, 0, pad_h_bottom, 0, pad_w_right,
-                                            cv2.BORDER_CONSTANT, value=[0,0,0]) # Pad with black
+                                            cv2.BORDER_CONSTANT, value=[0,0,0]) 
         h_proc, w_proc = img_to_process.shape[:2]
 
-        # Get Patch Coordinates for the (padded) image to process
         patch_coords_list = get_patch_coordinates(h_proc, w_proc, MODEL_INPUT_SIZE)
         if not patch_coords_list:
             print(f"  No patches generated for image {img_filename} (h_proc: {h_proc}, w_proc: {w_proc}, patch_size: {MODEL_INPUT_SIZE}). Skipping.")
             continue
-        print(f"  Generated {len(patch_coords_list)} patches for the image.")
+        # print(f"  Generated {len(patch_coords_list)} patches for the image.")
 
-        all_predicted_points_global = [] # Store all (x,y) predictions in original image coords
+        all_predicted_points_global_raw = [] 
+        processed_patch_count = 0
 
         for i, (x_start, y_start, x_end, y_end) in enumerate(patch_coords_list):
-            # print(f"    Processing patch {i+1}/{len(patch_coords_list)}: region ({x_start},{y_start}) to ({x_end},{y_end})")
-
-            # Extract patch image data
+            num_gt_in_patch = 0
+            if gt_orig_global.size > 0:
+                for gx_orig, gy_orig in gt_orig_global:
+                    if x_start <= gx_orig < x_end and y_start <= gy_orig < y_end:
+                        num_gt_in_patch += 1
+            
+            if num_gt_in_patch == 0:
+                continue 
+            
+            processed_patch_count += 1
             img_patch_np = img_to_process[y_start:y_end, x_start:x_end]
-
-            # Normalize patch and convert to tensor
             patch_tensor_np = img_patch_np.astype(np.float32) / 255.0
             patch_tensor_chw = torch.from_numpy(patch_tensor_np).permute(2, 0, 1)
             patch_tensor_norm = (patch_tensor_chw - IMG_MEAN_CPU) / IMG_STD_CPU
-            patch_tensor_batch = patch_tensor_norm.unsqueeze(0).to(DEVICE) # Batch dim (1, C, H, W)
+            patch_tensor_batch = patch_tensor_norm.unsqueeze(0).to(DEVICE) 
 
-            # Perform iterative inference on the patch using confidence
             predicted_points_local = perform_iterative_inference_on_patch(
-                model,
-                patch_tensor_batch,
-                psf_sigma=GT_PSF_SIGMA,
-                model_input_size=MODEL_INPUT_SIZE,
-                device=DEVICE,
-                confidence_threshold=CONFIDENCE_THRESHOLD, # Pass configured value
-                max_iterations=MAX_ITERATIONS_PER_PATCH    # Pass configured value
+                model, patch_tensor_batch, psf_sigma=GT_PSF_SIGMA,
+                model_input_size=MODEL_INPUT_SIZE, device=DEVICE,
+                confidence_threshold=CONFIDENCE_THRESHOLD, 
+                max_iterations=MAX_ITERATIONS_PER_PATCH    
             )
 
-            # Convert local predictions to global coordinates and store
             for plx, ply in predicted_points_local:
                 pgx, pgy = plx + x_start, ply + y_start
-                # Ensure predicted point is within original image bounds (before padding)
                 if pgx < w_orig and pgy < h_orig:
-                     all_predicted_points_global.append((pgx, pgy))
+                     all_predicted_points_global_raw.append((pgx, pgy))
 
             if patch_level_visuals_enabled and predicted_points_local:
-                # Get GT points local to this patch (for visualization only)
-                gt_local_to_patch = []
-                if gt_orig_global.size > 0:
+                gt_local_to_patch_coords = [] 
+                if gt_orig_global.size > 0: 
                     for gx_orig, gy_orig in gt_orig_global:
                         if x_start <= gx_orig < x_end and y_start <= gy_orig < y_end:
                             lx, ly = gx_orig - x_start, gy_orig - y_start
-                            gt_local_to_patch.append((lx, ly))
-                gt_local_to_patch_np = np.array(gt_local_to_patch)
-
+                            gt_local_to_patch_coords.append((lx, ly))
+                gt_local_to_patch_np = np.array(gt_local_to_patch_coords)
                 plt.figure(figsize=(6,6))
                 display_patch_tensor = patch_tensor_batch.squeeze(0).cpu() * IMG_STD_CPU + IMG_MEAN_CPU
                 display_patch_np = np.clip(display_patch_tensor.permute(1, 2, 0).numpy(), 0, 1)
                 plt.imshow(display_patch_np)
-                if gt_local_to_patch_np.size > 0:
+                if gt_local_to_patch_np.size > 0: 
                     plt.scatter(gt_local_to_patch_np[:,0], gt_local_to_patch_np[:,1], s=30, facecolors='none', edgecolors='lime', lw=1, label=f'Local GT ({len(gt_local_to_patch_np)})')
                 preds_local_np = np.array(predicted_points_local)
                 plt.scatter(preds_local_np[:,0], preds_local_np[:,1], s=20, c='red', marker='x', label=f'Local Preds ({len(preds_local_np)})')
-                plt.title(f"Patch {i+1} ({x_start},{y_start}) Results")
+                plt.title(f"Patch {i+1} (GT: {num_gt_in_patch}) Results") 
                 plt.axis('off'); plt.legend()
                 patch_plot_path = os.path.join(script_output_dir, f"{img_filestem}_patch_{i+1:03d}.png")
                 plt.savefig(patch_plot_path); plt.close()
+        
+        print(f"  Processed {processed_patch_count} (non-empty GT) out of {len(patch_coords_list)} total patches for image {img_filename}.")
+        
+        num_predicted_before_nms = len(all_predicted_points_global_raw)
+        all_predicted_points_global_nms = apply_nms(all_predicted_points_global_raw, NMS_RADIUS)
+        num_predicted_after_nms = len(all_predicted_points_global_nms)
+        
+        print(f"  Predicted points for {img_filename}: {num_predicted_before_nms} (before NMS), {num_predicted_after_nms} (after NMS with radius {NMS_RADIUS})")
 
-        # Final Visualization for the current image
+        # Calculate and accumulate absolute error for MAE
+        current_abs_error = abs(num_predicted_after_nms - num_gt_points_original_image)
+        total_absolute_error += current_abs_error
+        image_count_for_mae += 1
+        print(f"  Absolute Error for {img_filename}: {current_abs_error}")
+
         plt.figure(figsize=(12, 12 * h_orig / w_orig if w_orig > 0 else 12))
         plt.imshow(img_orig_rgb)
         if gt_orig_global.size > 0:
             plt.scatter(gt_orig_global[:, 0], gt_orig_global[:, 1], s=30, facecolors='none', edgecolors='lime', linewidths=1.5, label=f'Ground Truth ({num_gt_points_original_image})')
         
-        num_predicted_points = len(all_predicted_points_global)
-        if all_predicted_points_global:
-            preds_global_np = np.array(all_predicted_points_global)
-            plt.scatter(preds_global_np[:, 0], preds_global_np[:, 1], s=20, c='red', marker='x', label=f'Predicted ({num_predicted_points})')
+        if all_predicted_points_global_nms: 
+            preds_global_nms_np = np.array(all_predicted_points_global_nms)
+            plt.scatter(preds_global_nms_np[:, 0], preds_global_nms_np[:, 1], s=20, c='red', marker='x', label=f'Predicted (NMS, {num_predicted_after_nms})')
         
-        plt.title(f"Full Image Predictions for {img_filename}\nGT: {num_gt_points_original_image}, Pred: {num_predicted_points}")
+        plt.title(f"Full Image Predictions for {img_filename}\nGT: {num_gt_points_original_image}, Pred (NMS): {num_predicted_after_nms}, AE: {current_abs_error}")
         plt.axis('off'); plt.legend()
-        final_summary_path = os.path.join(script_output_dir, f"{img_filestem}_full_summary_conf.png")
+        final_summary_path = os.path.join(script_output_dir, f"{img_filestem}_full_summary_conf_nms.png")
         plt.savefig(final_summary_path); plt.close()
-        print(f"  Full image processing complete. Total points predicted: {num_predicted_points}")
+        # print(f"  Full image processing complete. Total points predicted (after NMS): {num_predicted_after_nms}") # Redundant with above
         print(f"  Final summary plot saved to: {final_summary_path}")
 
     print("\n--- All selected images processed. ---")
+
+    if image_count_for_mae > 0:
+        mae = total_absolute_error / image_count_for_mae
+        print(f"\nOverall Mean Absolute Error (MAE) for {image_count_for_mae} images: {mae:.2f}")
+    else:
+        print("\nNo images were processed for MAE calculation.")
 
 if __name__ == "__main__":
     main()
