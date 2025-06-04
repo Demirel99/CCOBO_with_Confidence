@@ -57,7 +57,7 @@ def create_input_psf_from_points(points_list, shape, sigma):
 # --- Main Script Logic ---
 
 # Path to the image
-image_file_path = r"C:\Users\Mehmet_Postdoc\Desktop\datasets_for_experiments\ShanghaiTech_Crowd_Counting_Dataset\part_A_final\test_data\images\IMG_115.jpg" #Example Path
+image_file_path = r"C:\Users\Mehmet_Postdoc\Desktop\datasets_for_experiments\ShanghaiTech_Crowd_Counting_Dataset\part_A_final\test_data\images\IMG_8.jpg" #Example Path
 
 # Load the image
 image = cv2.imread(image_file_path)
@@ -87,7 +87,7 @@ if not patches_orig_size:
 patches_resized = [cv2.resize(patch, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)) for patch in patches_orig_size]
 print(f"Resized patches to {MODEL_INPUT_SIZE}x{MODEL_INPUT_SIZE}.")
 
-patch_index_to_test = 1
+patch_index_to_test = 0
 if patch_index_to_test >= len(patches_resized):
     print(f"Error: Patch index {patch_index_to_test} is out of bounds. Max index is {len(patches_resized)-1}.")
     print(f"Using patch index 0 instead.")
@@ -146,7 +146,7 @@ display_patch_np = np.clip(display_patch_tensor_cpu.permute(1, 2, 0).numpy(), 0,
 print(f"\nStarting iterative inference on patch {patch_index_to_test}...")
 predicted_points_on_patch = [] # Stores (x,y) for PSF generation in next iteration
 all_predictions_with_scores = [] # Stores ((x,y), score) for all predictions
-num_iterations = 700 # Number of points to attempt to predict
+num_iterations = 20 # Number of points to attempt to predict
 
 for iter_num in range(num_iterations):
     current_input_psf_np = create_input_psf_from_points(

@@ -21,7 +21,7 @@ MIN_DIM_RESCALE = 256 # Minimum dimension allowed after random scaling (should b
 GT_PSF_SIGMA = 1      # Sigma for Gaussian kernel to generate GT PSFs
 
 # --- Training ---
-TOTAL_ITERATIONS = 100000
+TOTAL_ITERATIONS = 10000
 BATCH_SIZE = 8 # You might need to reduce batch size if 224x224 images cause memory issues
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4

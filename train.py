@@ -21,12 +21,11 @@ from config import (
 from utils import set_seed, find_and_sort_paths, split_train_val
 from dataset import generate_batch, generate_train_sample # generate_train_sample used by generate_batch
 from model import VGG19FPNASPP
-from losses import combined_loss # Updated import
+from losses import combined_loss 
 
-# Define loss weights (can be moved to config.py if needed)
 KL_LOSS_WEIGHT = 1.0
-BCE_LOSS_WEIGHT = 1.0 # Example: give more weight if confidence learning is difficult
-NEGATIVE_SAMPLE_PROB = 0.1 # Probability of generating a negative sample
+BCE_LOSS_WEIGHT = 1.0 
+NEGATIVE_SAMPLE_PROB = 0.1 
 
 def train():
     print("Setting up training...")
@@ -73,36 +72,32 @@ def train():
     for iteration in pbar:
         model.train()
 
-        # Generate batch including confidence targets
         img_batch, in_psf_batch, tgt_psf_batch, confidence_target_batch = generate_batch(
             train_image_paths, train_gt_paths, BATCH_SIZE,
             generation_fn=generate_train_sample,
             augment_size=AUGMENTATION_SIZE,
             model_input_size=MODEL_INPUT_SIZE,
             psf_sigma=GT_PSF_SIGMA,
-            negative_prob=NEGATIVE_SAMPLE_PROB # Pass negative_prob
+            negative_prob=NEGATIVE_SAMPLE_PROB 
         )
 
         if img_batch is None:
             print(f"Warning: Failed to generate training batch at iteration {iteration}. Skipping.")
             pbar.set_postfix_str("Batch gen failed, skipping")
-            if iteration % VALIDATION_INTERVAL == 0 and samples_in_accum == 0 : # If val is due and no training happened
-                 # Run validation with current model state if possible, or just log skip
+            if iteration % VALIDATION_INTERVAL == 0 and samples_in_accum == 0 : 
                  print("Skipping validation due to prior training batch failure & no accumulated loss.")
             continue
-
 
         img_batch = img_batch.to(DEVICE)
         in_psf_batch = in_psf_batch.to(DEVICE)
         tgt_psf_batch = tgt_psf_batch.to(DEVICE)
-        # Reshape confidence_target_batch from (B,) to (B, 1) for BCE loss
         confidence_target_batch = confidence_target_batch.to(DEVICE).unsqueeze(1) 
 
         optimizer.zero_grad()
         with autocast(enabled=use_amp):
-            predicted_psf, predicted_confidence_logits = model(img_batch, in_psf_batch) # Renamed here
+            predicted_psf, predicted_confidence_logits = model(img_batch, in_psf_batch) 
             loss, kl_loss_val, bce_loss_val = combined_loss(
-                predicted_psf, predicted_confidence_logits, # Pass logits
+                predicted_psf, predicted_confidence_logits, 
                 tgt_psf_batch, confidence_target_batch,
                 kl_weight=KL_LOSS_WEIGHT, bce_weight=BCE_LOSS_WEIGHT
             )
@@ -124,7 +119,7 @@ def train():
             avg_train_kl_loss = train_kl_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
             avg_train_bce_loss = train_bce_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
             
-            train_total_loss_log.append(avg_train_total_loss) # Log train loss at validation points
+            train_total_loss_log.append(avg_train_total_loss) 
 
             rng_state = {'random': random.getstate(), 'numpy': np.random.get_state(), 'torch': torch.get_rng_state(),
                          'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
@@ -141,7 +136,8 @@ def train():
                         val_image_paths, val_gt_paths, BATCH_SIZE,
                         generation_fn=generate_train_sample,
                         augment_size=AUGMENTATION_SIZE, model_input_size=MODEL_INPUT_SIZE,
-                        psf_sigma=GT_PSF_SIGMA, negative_prob=NEGATIVE_SAMPLE_PROB
+                        psf_sigma=GT_PSF_SIGMA, negative_prob=NEGATIVE_SAMPLE_PROB,
+                        skew_target_selection_to_top=True # <<< MODIFICATION HERE
                     )
                     if val_img is None: continue
 
@@ -151,9 +147,9 @@ def train():
                     val_conf_tgt = val_conf_tgt.to(DEVICE).unsqueeze(1)
 
                     with autocast(enabled=use_amp):
-                        val_pred_psf, val_pred_conf_logits = model(val_img, val_in_psf) # Renamed here
+                        val_pred_psf, val_pred_conf_logits = model(val_img, val_in_psf) 
                         v_loss, v_kl, v_bce = combined_loss(
-                            val_pred_psf, val_pred_conf_logits, val_tgt_psf, val_conf_tgt, # Pass logits
+                            val_pred_psf, val_pred_conf_logits, val_tgt_psf, val_conf_tgt, 
                             kl_weight=KL_LOSS_WEIGHT, bce_weight=BCE_LOSS_WEIGHT
                         )
                     val_total_loss_epoch += v_loss.item() * val_img.size(0)

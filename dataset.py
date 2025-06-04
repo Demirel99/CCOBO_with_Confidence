@@ -109,7 +109,7 @@ def get_center_crop_coords(image_size, crop_size):
     start_x = max(0, (img_w - crop_w) // 2)
     return start_y, start_x
 
-def get_random_coord_index_in_center(coordinates, image_shape, center_crop_shape):
+def get_random_coord_index_in_center(coordinates, image_shape, center_crop_shape, skew_to_top=False): # Added skew_to_top
     if coordinates is None or coordinates.shape[0] == 0: return None
     img_h, img_w = image_shape
     crop_h, crop_w = center_crop_shape
@@ -119,11 +119,39 @@ def get_random_coord_index_in_center(coordinates, image_shape, center_crop_shape
         i for i, (x, y) in enumerate(coordinates)
         if start_x <= x < end_x and start_y <= y < end_y
     ]
-    return random.choice(indices_in_center) if indices_in_center else None
+    if not indices_in_center:
+        return None
+    
+    if skew_to_top:
+        # Create a list of (index_in_coordinates, y_coordinate) for candidates
+        candidate_targets_with_y = []
+        for idx in indices_in_center:
+            # coordinates[idx] is (x,y), so coordinates[idx][1] is the y-coordinate
+            candidate_targets_with_y.append((idx, coordinates[idx][1]))
+        
+        # Sort candidates by y-coordinate (ascending, so top-most first)
+        sorted_candidate_targets = sorted(candidate_targets_with_y, key=lambda item: item[1])
+        
+        num_candidates = len(sorted_candidate_targets)
+        if num_candidates == 1:
+            return sorted_candidate_targets[0][0] # Return the only candidate's index
+            
+        # Generate weights: higher weight for smaller rank (top-most points)
+        # Using 1/(rank+1) as weights. Can be adjusted (e.g., (1/(rank+1))**2 for stronger skew)
+        weights = [1.0 / (rank + 1) for rank in range(num_candidates)]
+        
+        # Choose one candidate based on the weights
+        # random.choices returns a list of k elements, so take the first one
+        chosen_candidate = random.choices(sorted_candidate_targets, weights=weights, k=1)[0]
+        return chosen_candidate[0] # Return the original index from 'coordinates'
+    else:
+        # Original random selection
+        return random.choice(indices_in_center)
+
 
 def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
                           model_input_size=MODEL_INPUT_SIZE, psf_sigma=GT_PSF_SIGMA,
-                          negative_prob=0.1): # Added negative_prob
+                          negative_prob=0.1, skew_target_selection_to_top=False): # Added skew_target_selection_to_top
     max_retries = 10
     for _ in range(max_retries):
         rand_idx = random.randint(0, len(image_paths) - 1)
@@ -163,44 +191,40 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         aug_image, aug_gt_coor = prepare_data_augmentations(image, gt_coor.copy(), target_size=augment_size)
         if aug_image is None or aug_gt_coor is None: continue
         
-        # If no GT points remain in the augmented crop, retry.
-        # Negative samples are meaningful when there *are* some points, and we say "no more after these".
         if aug_gt_coor.shape[0] < 1: continue 
 
         img_h, img_w = aug_image.shape[:2]
         if img_h == 0 or img_w == 0: print(f"Warning: Augmented image has zero dimension for {image_path}. Skipping."); continue
 
-        # Sort points: primary key = y descending (bottom first), secondary key = x ascending (left first)
         sorted_indices = np.lexsort((aug_gt_coor[:, 0], -aug_gt_coor[:, 1]))
         sorted_aug_gt_coor = aug_gt_coor[sorted_indices]
         num_actual_points_in_aug_crop = len(sorted_aug_gt_coor)
 
-        # Determine if this sample is positive (next person) or negative (no next person)
         is_negative_sample = random.random() < negative_prob
-        
-        num_previous_points_for_input_psf = 0 # Default for positive sample with timestep 0
+        num_previous_points_for_input_psf = 0 
 
         if is_negative_sample:
             confidence_target = 0.0
-            target_psf_full = np.zeros((img_h, img_w), dtype=np.float32) # No target point
-            # For input PSF, all actual points in the crop are considered "previous"
+            target_psf_full = np.zeros((img_h, img_w), dtype=np.float32) 
             num_previous_points_for_input_psf = num_actual_points_in_aug_crop
-        else: # Positive sample
+        else: 
             confidence_target = 1.0
             center_crop_shape = (model_input_size, model_input_size)
             
-            # Get the index (within sorted_aug_gt_coor) of a random point that falls in the center crop.
-            # This index 'k' means the target is sorted_aug_gt_coor[k].
-            # Points sorted_aug_gt_coor[0]...sorted_aug_gt_coor[k-1] form the input PSF.
-            timestep_k_for_target = get_random_coord_index_in_center(sorted_aug_gt_coor, (img_h, img_w), center_crop_shape)
+            # Pass skew_target_selection_to_top to get_random_coord_index_in_center
+            timestep_k_for_target = get_random_coord_index_in_center(
+                sorted_aug_gt_coor, 
+                (img_h, img_w), 
+                center_crop_shape,
+                skew_to_top=skew_target_selection_to_top # New argument passed here
+            )
             
-            if timestep_k_for_target is None: # No points in the center crop to select as target
-                 continue # Retry for a positive sample
+            if timestep_k_for_target is None: 
+                 continue 
 
             target_psf_full = generate_single_psf(sorted_aug_gt_coor[timestep_k_for_target], (img_h, img_w), psf_sigma)
-            num_previous_points_for_input_psf = timestep_k_for_target # Points 0 to k-1 are previous
+            num_previous_points_for_input_psf = timestep_k_for_target 
 
-        # Generate Input PSF based on num_previous_points_for_input_psf
         input_psf_full = np.zeros((img_h, img_w), dtype=np.float32)
         if num_previous_points_for_input_psf > 0:
             previous_points_map = np.zeros((img_h, img_w), dtype=np.float32)
@@ -212,7 +236,6 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
             if np.sum(previous_points_map) > 1e-7:
                  input_psf_full = gaussian_filter(previous_points_map, sigma=psf_sigma, order=0, mode='constant', cval=0.0)
 
-        # Center Crop Image and PSFs
         center_crop_shape = (model_input_size, model_input_size)
         start_y, start_x = get_center_crop_coords((img_h, img_w), center_crop_shape)
         end_y, end_x = start_y + model_input_size, start_x + model_input_size
@@ -226,7 +249,6 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
            final_input_psf.shape != center_crop_shape or \
            final_target_psf.shape != center_crop_shape: print(f"Warning: Cropped shape mismatch for {image_path}. Skipping."); continue
 
-        # Normalize Image and PSFs
         final_image_tensor = torch.from_numpy(final_image.copy()).permute(2, 0, 1).float() / 255.0
         final_image_tensor = (final_image_tensor - IMG_MEAN) / IMG_STD
 
@@ -234,9 +256,7 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         if max_val_in > 1e-7: final_input_psf = final_input_psf / max_val_in
         final_input_psf_tensor = torch.from_numpy(final_input_psf).float().unsqueeze(0)
 
-        # Target PSF for positive samples should sum to 1 after gaussian_filter
-        # For negative samples, it's all zeros, sum is 0.
-        if not is_negative_sample: # Only normalize target PSF if it's not a negative (all-zero) sample
+        if not is_negative_sample: 
             target_psf_sum = np.sum(final_target_psf)
             if target_psf_sum > 1e-7:
                 final_target_psf = final_target_psf / target_psf_sum
@@ -260,15 +280,15 @@ def generate_batch(image_paths, gt_paths, batch_size, generation_fn=generate_tra
     """Generates a batch of data including confidence targets."""
     image_batch, input_psf_batch, output_psf_batch, confidence_target_batch = [], [], [], []
     attempts = 0
-    max_attempts = batch_size * 10 # Increased max_attempts
+    max_attempts = batch_size * 10 
 
     while len(image_batch) < batch_size and attempts < max_attempts:
         attempts += 1
         try:
-            # Pass kwargs (like negative_prob) to generation_fn
+            # Pass kwargs (like negative_prob, skew_target_selection_to_top) to generation_fn
             sample = generation_fn(image_paths, gt_paths, **kwargs) 
 
-            if sample is not None and sample[0] is not None: # Check if all 4 components are not None
+            if sample is not None and sample[0] is not None: 
                 img, in_psf, out_psf, conf_tgt = sample
                 if isinstance(img, torch.Tensor) and isinstance(in_psf, torch.Tensor) and \
                    isinstance(out_psf, torch.Tensor) and isinstance(conf_tgt, torch.Tensor):
@@ -284,7 +304,7 @@ def generate_batch(image_paths, gt_paths, batch_size, generation_fn=generate_tra
             print(traceback.format_exc())
             continue
 
-    if not image_batch: # Check if any samples were generated
+    if not image_batch: 
         print(f"Warning: Failed to generate any valid samples for a batch after {max_attempts} attempts.")
         return None, None, None, None
 
@@ -292,11 +312,13 @@ def generate_batch(image_paths, gt_paths, batch_size, generation_fn=generate_tra
         final_image_batch = torch.stack(image_batch)
         final_input_psf_batch = torch.stack(input_psf_batch)
         final_output_psf_batch = torch.stack(output_psf_batch)
-        final_confidence_target_batch = torch.stack(confidence_target_batch) # Will be (B,)
+        final_confidence_target_batch = torch.stack(confidence_target_batch) 
         return final_image_batch, final_input_psf_batch, final_output_psf_batch, final_confidence_target_batch
     except Exception as e:
         print(f"Error during torch.stack: {e}")
-        # ... (existing error printing for shapes) ...
+        if image_batch: print("Individual image shapes:", [t.shape for t in image_batch])
+        if input_psf_batch: print("Individual input_psf shapes:", [t.shape for t in input_psf_batch])
+        if output_psf_batch: print("Individual output_psf shapes:", [t.shape for t in output_psf_batch])
         if confidence_target_batch: print("Individual confidence target shapes:", [t.shape for t in confidence_target_batch])
         return None, None, None, None
 
@@ -304,20 +326,22 @@ if __name__ == "__main__":
     print("Running dataset.py test...")
     test_image_dir = IMAGE_DIR_TRAIN_VAL
     test_gt_dir = GT_DIR_TRAIN_VAL
-    num_samples_to_show = 5 # Show more samples to check for negative ones
+    num_samples_to_show = 5 
 
-    # ... (rest of the existing __main__ setup) ...
     image_paths = sorted(glob.glob(os.path.join(test_image_dir, '*.jpg')))
     gt_paths = sorted(glob.glob(os.path.join(test_gt_dir, '*.mat')))
     if not image_paths: print(f"Error: No images found in {test_image_dir}"); exit()
     print(f"Found {len(image_paths)} images.")
 
     for i in range(num_samples_to_show):
-        print(f"\n--- Generating Sample {i+1}/{num_samples_to_show} (negative_prob=0.3 for testing) ---")
+        # Test with skewing enabled for one of the samples
+        skew_test = True if i == num_samples_to_show -1 else False # Enable for the last sample
+        print(f"\n--- Generating Sample {i+1}/{num_samples_to_show} (negative_prob=0.3, skew_to_top={skew_test}) ---")
         sample_data = generate_train_sample(
             image_paths, gt_paths,
             augment_size=AUGMENTATION_SIZE, model_input_size=MODEL_INPUT_SIZE,
-            psf_sigma=GT_PSF_SIGMA, negative_prob=0.3 # Test with higher neg prob
+            psf_sigma=GT_PSF_SIGMA, negative_prob=0.3,
+            skew_target_selection_to_top=skew_test 
         )
 
         if sample_data is None or sample_data[0] is None:
@@ -332,7 +356,6 @@ if __name__ == "__main__":
         print(f"  Target PSF: {target_psf_tensor.shape}")
         print(f"  Confidence Target: {confidence_target_tensor.shape}, Value: {confidence_target_tensor.item():.1f}")
 
-        # ... (rest of the visualization, ensure title reflects confidence target) ...
         img_vis = img_tensor.cpu() * IMG_STD.cpu() + IMG_MEAN.cpu()
         img_vis = torch.clamp(img_vis, 0, 1)
         img_vis_np = img_vis.permute(1, 2, 0).numpy()        
@@ -342,7 +365,8 @@ if __name__ == "__main__":
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         title_suffix = "POSITIVE" if confidence_target_tensor.item() == 1.0 else "NEGATIVE (No Next Person)"
-        fig.suptitle(f'Generated Sample {i+1} ({title_suffix})', fontsize=16)
+        skew_title = " (Skewed Top)" if skew_test and confidence_target_tensor.item() == 1.0 else ""
+        fig.suptitle(f'Generated Sample {i+1} ({title_suffix}{skew_title})', fontsize=16)
 
         axes[0].imshow(img_vis_np)
         axes[0].set_title(f'Input Image ({MODEL_INPUT_SIZE}x{MODEL_INPUT_SIZE})')
